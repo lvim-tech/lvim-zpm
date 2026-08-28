@@ -1,0 +1,15 @@
+[package]
+name = "lvim-zpm"
+version = "0.1.0"
+edition = "2021"
+authors = ["lvim-tech"]
+description = "A tpm-like plugin manager for zellij: declarative manifest, git sources, live keybinds"
+license = "BSD-3-Clause"
+
+[dependencies]
+zellij-tile = "0.44.3"
+
+[profile.release]
+lto = true
+opt-level = "z"
+strip = true
