@@ -87,6 +87,13 @@ With `link`, permissions and `{{wasm}}` point at the installed copy.
 ordinary zellij config syntax, applied live via `reconfigure()`. Repos are expected to **ship the
 built wasm** — the manager clones and applies; it does not build.
 
+**Keybind plugins also want a `load_plugins` entry** in `config.kdl`, with the same URL the
+keybinds pipe to (`file:~/.config/zellij/zpm/plugins/<name>/<wasm>`): a preloaded background
+instance is what a keybind pipe reaches. Without it the first keypress launches the target — into
+a visible tiled pane, which is how zellij launches a keybind pipe's missing target. (This cannot
+be done live: `load_plugins` is only read at session start, and reconfigure() merging it is a
+no-op.)
+
 ## Notes
 
 - One manager instance runs per session (a `load_plugins` background plugin). Operations are
