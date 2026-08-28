@@ -43,6 +43,7 @@ New sessions realize the manifest by themselves (that is the tpm move). Inside a
 
 ```sh
 zellij pipe -p file:~/.config/zellij/plugins/lvim-zpm.wasm -n status    # what is installed/applied
+zellij pipe -p file:~/.config/zellij/plugins/lvim-zpm.wasm -n check     # fetch + report who has updates (touches nothing)
 zellij pipe -p file:~/.config/zellij/plugins/lvim-zpm.wasm -n install   # clone missing, re-apply
 zellij pipe -p file:~/.config/zellij/plugins/lvim-zpm.wasm -n update    # git pull all, re-apply
 ```

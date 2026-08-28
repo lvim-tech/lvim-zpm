@@ -140,6 +140,7 @@ struct Managed {
     permissions: Vec<String>,
     keybinds: Option<String>, // ready-to-apply block ({{wasm}} already substituted)
     note: String,             // one status line for the report
+    check: Option<String>,    // check verb: "same" | "diff" | anything else = could not tell
 }
 
 impl Managed {
@@ -183,6 +184,7 @@ impl Managed {
 #[derive(Clone, Copy, PartialEq)]
 enum Verb {
     Status,
+    Check,
     Install,
     Update,
 }
@@ -235,6 +237,7 @@ impl ZellijPlugin for State {
     fn pipe(&mut self, message: PipeMessage) -> bool {
         let verb = match message.name.as_str() {
             "status" => Verb::Status,
+            "check" => Verb::Check,
             "install" => Verb::Install,
             "update" => Verb::Update,
             _ => return false, // not ours (e.g. another plugin's broadcast)
@@ -316,7 +319,7 @@ impl State {
                 (name.clone(), Some(entry.clone()), format!("{STORE}/{name}"))
             };
             if let Some(repo) = &github {
-                if verb != Verb::Status {
+                if verb == Verb::Install || verb == Verb::Update {
                     script.push_str(&format!(
                         "if [ ! -d \"{root}/.git\" ]; then \
                          git clone --depth 1 \"https://github.com/{repo}\" \"{root}\" >/dev/null 2>&1 \
@@ -327,6 +330,18 @@ impl State {
                     script.push_str(&format!(
                         "git -C \"{root}\" pull --ff-only >/dev/null 2>&1 \
                          || echo \"@@FAIL {name} pull failed\"\n"
+                    ));
+                }
+                if verb == Verb::Check {
+                    // Fetch, then compare plain hashes — shallow-clone safe (no ancestry walk).
+                    script.push_str(&format!(
+                        "if [ -d \"{root}/.git\" ] && git -C \"{root}\" fetch -q origin >/dev/null 2>&1; then \
+                         b=$(git -C \"{root}\" rev-parse --abbrev-ref HEAD 2>/dev/null); \
+                         l=$(git -C \"{root}\" rev-parse HEAD 2>/dev/null); \
+                         r=$(git -C \"{root}\" rev-parse \"origin/$b\" 2>/dev/null); \
+                         if [ -n \"$l\" ] && [ \"$l\" = \"$r\" ]; then echo \"@@CHECK {name} same\"; \
+                         else echo \"@@CHECK {name} diff\"; fi; \
+                         else echo \"@@CHECK {name} unknown\"; fi\n"
                     ));
                 }
             }
@@ -350,6 +365,14 @@ impl State {
             if let Some(fail) = line.strip_prefix("@@FAIL ") {
                 self.report.push(format!("  ✗ {fail}"));
             }
+            if let Some(check) = line.strip_prefix("@@CHECK ") {
+                if let Some((name, state)) = check.split_once(' ') {
+                    let name = name.to_string();
+                    if let Some(plugin) = self.plugins.iter_mut().find(|p| p.name == name) {
+                        plugin.check = Some(state.trim().to_string());
+                    }
+                }
+            }
         }
         let mut sections = out.split("===PLUGIN ");
         sections.next(); // preamble (clone failures already collected)
@@ -372,8 +395,8 @@ impl State {
                 (None, _, _) => "✗ manifest names no wasm".into(),
             };
         }
-        if self.verb == Some(Verb::Status) {
-            self.finish(); // status looks, never touches
+        if self.verb == Some(Verb::Status) || self.verb == Some(Verb::Check) {
+            self.finish(); // status and check look (check also fetches), never touch
             return;
         }
         let mut script = String::from("mkdir -p \"$HOME/.cache/zellij\"\n");
@@ -420,13 +443,21 @@ impl State {
     fn finish(&mut self) {
         let verb = match self.verb {
             Some(Verb::Status) => "status",
+            Some(Verb::Check) => "check",
             Some(Verb::Update) => "update",
             _ => "install",
         };
         let mut lines = vec![format!("lvim-zpm {verb}:")];
         for plugin in &self.plugins {
             let source = plugin.github.as_deref().unwrap_or(&plugin.root);
-            let applied = if self.verb == Some(Verb::Status) {
+            let applied = if self.verb == Some(Verb::Check) {
+                match plugin.check.as_deref() {
+                    Some("same") => " — up to date",
+                    Some("diff") => " — UPDATE AVAILABLE (run update)",
+                    Some(_) => " — could not check",
+                    None => " — local, nothing to check",
+                }
+            } else if self.verb == Some(Verb::Status) {
                 ""
             } else if plugin.keybinds.is_some() {
                 " — keybinds applied"
