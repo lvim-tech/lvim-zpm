@@ -419,10 +419,18 @@ impl State {
                 .iter()
                 .map(|p| format!("    {p}\\n"))
                 .collect::<String>();
+            // REWRITE the grant, never append-once: zellij sometimes rewrites this file from a
+            // live server's memory and resurrects a stale block, which would then shadow the
+            // manifest's truth forever (a save key failing with "denied" was exactly that). The
+            // awk drops the existing block for this wasm, the printf appends the current one.
+            script.push_str(&format!("t=\"{PERMS}.zpm.$$\"\n"));
             script.push_str(&format!(
-                "grep -q \"{target}\" \"{PERMS}\" 2>/dev/null \
-                 || printf '\"%s\" {{\\n{block}}}\\n' \"{target}\" >> \"{PERMS}\"\n"
+                "awk -v k='\"{target}\" {{' 'BEGIN{{s=0}} index($0,k)==1{{s=1;next}} s{{if($0~/^}}/)s=0;next}} {{print}}' \"{PERMS}\" 2>/dev/null > \"$t\"\n"
             ));
+            script.push_str(&format!(
+                "printf '\"%s\" {{\\n{block}}}\\n' \"{target}\" >> \"$t\"\n"
+            ));
+            script.push_str(&format!("mv \"$t\" \"{PERMS}\"\n"));
         }
         run_step("grant", &script);
     }
