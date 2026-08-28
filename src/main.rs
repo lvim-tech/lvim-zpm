@@ -134,15 +134,19 @@ struct Managed {
     name: String,             // basename of the repo / local dir
     github: Option<String>,   // "owner/repo" for git sources, None for local ones
     root: String,             // absolute directory on the host (filled by the sync step)
-    wasm: Option<String>,     // absolute path of the built wasm
+    wasm: Option<String>,     // absolute path of the built wasm inside the repo
+    link: Option<String>,     // install the wasm as <config>/plugins/<link> (layout plugins)
+    installed: Option<String>, // the resolved install path when `link` is set
     permissions: Vec<String>,
     keybinds: Option<String>, // ready-to-apply block ({{wasm}} already substituted)
     note: String,             // one status line for the report
 }
 
 impl Managed {
-    /// Parse this plugin's own zpm.kdl (root is already known).
-    fn read_manifest(&mut self, text: &str) {
+    /// Parse this plugin's own zpm.kdl (root is already known). With `link`, the wasm is INSTALLED
+    /// to the fixed plugins directory — the place layouts reference — and everything else (grants,
+    /// `{{wasm}}`) points there; without it the repo's own wasm is the target.
+    fn read_manifest(&mut self, text: &str, home: &str) {
         for line in text.lines() {
             let line = uncommented(line);
             let word = line.split_whitespace().next().unwrap_or("");
@@ -152,13 +156,22 @@ impl Managed {
                         self.wasm = Some(format!("{}/{}", self.root, rel));
                     }
                 }
+                "link" => self.link = quoted(line).into_iter().next(),
                 "permissions" => self.permissions = quoted(line),
                 _ => {}
             }
         }
-        if let (Some(block), Some(wasm)) = (keybinds_block(text), &self.wasm) {
-            self.keybinds = Some(block.replace("{{wasm}}", &format!("file:{}", wasm)));
+        if let (Some(link), Some(_)) = (&self.link, &self.wasm) {
+            self.installed = Some(format!("{home}/.config/zellij/plugins/{link}"));
         }
+        if let (Some(block), Some(target)) = (keybinds_block(text), self.target()) {
+            self.keybinds = Some(block.replace("{{wasm}}", &format!("file:{target}")));
+        }
+    }
+
+    /// The wasm path everything points at: the installed copy when linked, the repo one otherwise.
+    fn target(&self) -> Option<String> {
+        self.installed.clone().or_else(|| self.wasm.clone())
     }
 }
 
@@ -176,6 +189,7 @@ enum Verb {
 
 #[derive(Default)]
 struct State {
+    home: String,
     permitted: bool,
     busy: bool,
     verb: Option<Verb>,
@@ -264,7 +278,7 @@ impl State {
         self.report.clear();
         run_step(
             "manifest",
-            &format!("mkdir -p \"{STORE}\"; cat \"{MANIFEST}\" 2>/dev/null"),
+            &format!("mkdir -p \"{STORE}\"; echo \"$HOME\"; cat \"{MANIFEST}\" 2>/dev/null"),
         );
     }
 
@@ -281,7 +295,9 @@ impl State {
     /// clone exists (and pulls, on update), then prints each plugin's own manifest between
     /// markers — one host round-trip for everything.
     fn on_manifest(&mut self, out: &str) {
-        let entries = parse_user_manifest(out);
+        let (home, manifest) = out.split_once('\n').unwrap_or(("", out));
+        self.home = home.trim().to_string();
+        let entries = parse_user_manifest(manifest);
         if entries.is_empty() {
             self.done(format!(
                 "lvim-zpm: nothing to manage — list plugins in {} (\"owner/repo\" or \"file:/abs/dir\")",
@@ -347,11 +363,13 @@ impl State {
                 plugin.note = "✗ no zpm.kdl manifest".into();
                 continue;
             }
-            plugin.read_manifest(body);
-            plugin.note = match (&plugin.wasm, &plugin.keybinds) {
-                (Some(_), Some(_)) => "✓".into(),
-                (Some(_), None) => "✓ (no keybinds)".into(),
-                (None, _) => "✗ manifest names no wasm".into(),
+            let home = self.home.clone();
+            plugin.read_manifest(body, &home);
+            plugin.note = match (&plugin.wasm, &plugin.keybinds, &plugin.link) {
+                (Some(_), Some(_), _) => "✓".into(),
+                (Some(_), None, Some(_)) => "✓ (layout plugin)".into(),
+                (Some(_), None, None) => "✓ (no keybinds)".into(),
+                (None, _, _) => "✗ manifest names no wasm".into(),
             };
         }
         if self.verb == Some(Verb::Status) {
@@ -361,6 +379,15 @@ impl State {
         let mut script = String::from("mkdir -p \"$HOME/.cache/zellij\"\n");
         for plugin in &self.plugins {
             let Some(wasm) = &plugin.wasm else { continue };
+            let Some(target) = plugin.target() else { continue };
+            // A linked plugin's wasm is INSTALLED (copied when it changed) to the fixed plugins
+            // directory, where layouts reference it by path.
+            if let Some(installed) = &plugin.installed {
+                script.push_str(&format!(
+                    "mkdir -p \"$HOME/.config/zellij/plugins\"\n\
+                     cmp -s \"{wasm}\" \"{installed}\" || cp \"{wasm}\" \"{installed}\"\n"
+                ));
+            }
             if plugin.permissions.is_empty() {
                 continue;
             }
@@ -370,8 +397,8 @@ impl State {
                 .map(|p| format!("    {p}\\n"))
                 .collect::<String>();
             script.push_str(&format!(
-                "grep -q \"{wasm}\" \"{PERMS}\" 2>/dev/null \
-                 || printf '\"%s\" {{\\n{block}}}\\n' \"{wasm}\" >> \"{PERMS}\"\n"
+                "grep -q \"{target}\" \"{PERMS}\" 2>/dev/null \
+                 || printf '\"%s\" {{\\n{block}}}\\n' \"{target}\" >> \"{PERMS}\"\n"
             ));
         }
         run_step("grant", &script);
@@ -399,8 +426,12 @@ impl State {
         let mut lines = vec![format!("lvim-zpm {verb}:")];
         for plugin in &self.plugins {
             let source = plugin.github.as_deref().unwrap_or(&plugin.root);
-            let applied = if self.verb != Some(Verb::Status) && plugin.keybinds.is_some() {
+            let applied = if self.verb == Some(Verb::Status) {
+                ""
+            } else if plugin.keybinds.is_some() {
                 " — keybinds applied"
+            } else if plugin.installed.is_some() {
+                " — wasm installed"
             } else {
                 ""
             };

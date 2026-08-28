@@ -68,6 +68,20 @@ plugin {
 }
 ```
 
+A **layout** plugin (a status bar, anything living in a layout pane) has no keybinds; instead it
+declares `link` and the manager keeps a copy of its wasm INSTALLED at the fixed path layouts
+reference (`~/.config/zellij/plugins/<link>`), refreshed whenever the repo's wasm changes:
+
+```kdl
+plugin {
+    wasm "my-bar.wasm"
+    link "my-bar.wasm"          // installed as ~/.config/zellij/plugins/my-bar.wasm
+    permissions "ReadApplicationState"
+}
+```
+
+With `link`, permissions and `{{wasm}}` point at the installed copy.
+
 `{{wasm}}` is replaced with the absolute `file:` URL of the built wasm. The `keybinds` block is
 ordinary zellij config syntax, applied live via `reconfigure()`. Repos are expected to **ship the
 built wasm** — the manager clones and applies; it does not build.
