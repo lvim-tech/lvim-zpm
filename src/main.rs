@@ -33,6 +33,14 @@
 //   zellij pipe -p file:…/lvim-zpm.wasm -n install    clone anything missing, re-apply
 //   zellij pipe -p file:…/lvim-zpm.wasm -n update     git pull every git-sourced plugin, re-apply
 //
+// **Live bindings belong to a client, and a client that attaches loses them.** zellij keeps the
+// runtime config per client id, and on attach overwrites it with the config the client brought from
+// disk. A client entering a session that has no one else in it is handed id 1 again — the id this
+// instance already runs for — so no new instance loads and nothing here would notice. What does
+// arrive is `SessionUpdate`, sent the moment a client is added, carrying the session's client count:
+// a rise in it re-applies the blocks of the last run (measured 2026-09-19: a jump from lvim-zclaude
+// into another session left `Ctrl s a` dead there).
+//
 // Operations are serialized (one at a time; a pipe during a run is queued) and host work is async
 // (`RunCommandResult` events route by the `zpm_step` context tag). The CLI gets an immediate
 // acknowledgement — zellij's server caps a waiting CLI pipe at one second, and a git clone will
@@ -198,6 +206,19 @@ struct State {
     queued: Option<Verb>,
     plugins: Vec<Managed>,
     report: Vec<String>,
+    /// The keybinds blocks the last run applied — what an attaching client gets back.
+    applied: Vec<String>,
+    /// Clients connected to this session at the last `SessionUpdate`.
+    clients: Option<usize>,
+}
+
+/// Whether a session update means a client has come in: the count rose. The first update only sets
+/// the baseline — the run that follows the grant applies for the client that is there.
+///
+/// An update read back from another server's metadata can be stale and fake a rise; that costs one
+/// reconfigure the server finds unchanged, and nothing more.
+fn client_arrived(before: Option<usize>, now: usize) -> bool {
+    matches!(before, Some(before) if now > before)
 }
 
 register_plugin!(State);
@@ -208,8 +229,13 @@ impl ZellijPlugin for State {
             PermissionType::RunCommands,                  // git + reading manifests + the grant step
             PermissionType::Reconfigure,                  // apply keybinds to the live session
             PermissionType::ReadCliPipes,                 // answer the status/install/update verbs
+            PermissionType::ReadApplicationState,         // SessionUpdate: a client attached
         ]);
-        subscribe(&[EventType::RunCommandResult, EventType::PermissionRequestResult]);
+        subscribe(&[
+            EventType::RunCommandResult,
+            EventType::PermissionRequestResult,
+            EventType::SessionUpdate,
+        ]);
     }
 
     fn update(&mut self, event: Event) -> bool {
@@ -228,6 +254,39 @@ impl ZellijPlugin for State {
                 let out = String::from_utf8_lossy(&stdout).to_string();
                 let err = String::from_utf8_lossy(&stderr).to_string();
                 self.on_step(&step, exit.unwrap_or(-1), &out, &err);
+            }
+            Event::SessionUpdate(sessions, _) => {
+                let Some(here) = sessions.iter().find(|s| s.is_current_session) else {
+                    return false;
+                };
+                let now = here.connected_clients;
+                if !self.permitted {
+                    // An instance loaded while nobody was attached (a reload of a detached
+                    // session) never hears `Granted` — the answer is addressed to a client that is
+                    // not there — and would refuse every pipe forever. This event is filtered by
+                    // `ReadApplicationState`, one of the four asked for together: its arrival IS
+                    // the grant. Measured 2026-09-19 on EXAMS after `start-or-reload-plugin`.
+                    self.permitted = true;
+                    self.clients = Some(now);
+                    self.begin(Verb::Install);
+                    return false;
+                }
+                if client_arrived(self.clients, now) {
+                    if !self.applied.is_empty() {
+                        // Straight from memory, not a new run: the person who just arrived is
+                        // about to press a key, and a manifest read is a host round-trip.
+                        for keybinds in &self.applied {
+                            reconfigure(keybinds.clone(), false);
+                        }
+                        eprintln!(
+                            "lvim-zpm: client {} attached — keybinds re-applied",
+                            get_plugin_ids().client_id
+                        );
+                    } else if !self.busy {
+                        self.begin(Verb::Install);
+                    }
+                }
+                self.clients = Some(now);
             }
             _ => {}
         }
@@ -440,9 +499,11 @@ impl State {
     /// keybind pipe starts its target with the keybind's own identity, the only identity later
     /// pipes will match (a pre-warmed instance would carry a different one and idle forever).
     fn apply(&mut self) {
+        self.applied.clear();
         for plugin in &self.plugins {
             if let Some(keybinds) = &plugin.keybinds {
                 reconfigure(keybinds.clone(), false); // live only — the config file is not ours
+                self.applied.push(keybinds.clone());
             }
         }
         self.finish();
@@ -455,7 +516,9 @@ impl State {
             Some(Verb::Update) => "update",
             _ => "install",
         };
-        let mut lines = vec![format!("lvim-zpm {verb}:")];
+        // The client this instance answers for: zellij runs one instance per client, and a report
+        // that does not say whose it is cannot tell a working session from a stale instance.
+        let mut lines = vec![format!("lvim-zpm {verb} (client {}):", get_plugin_ids().client_id)];
         for plugin in &self.plugins {
             let source = plugin.github.as_deref().unwrap_or(&plugin.root);
             let applied = if self.verb == Some(Verb::Check) {
@@ -502,4 +565,25 @@ fn run_step(step: &str, script: &str) {
     let mut context = BTreeMap::new();
     context.insert("zpm_step".to_string(), step.to_string());
     run_command(&["sh", "-c", script], context);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // The host import every zellij-tile call goes through. A native test binary has no host, and
+    // the linker wants the symbol all the same; nothing here ever calls it.
+    #[unsafe(no_mangle)]
+    extern "C" fn host_run_plugin_command() {}
+
+    /// A client coming in raises the count; that and only that re-applies. The first update sets
+    /// the baseline, and a client leaving is not a reason to touch anything.
+    #[test]
+    fn only_a_rise_in_clients_is_an_arrival() {
+        assert!(!client_arrived(None, 1), "the first update is the baseline");
+        assert!(client_arrived(Some(0), 1), "a detached session getting its client back");
+        assert!(client_arrived(Some(1), 2), "a second terminal attaching");
+        assert!(!client_arrived(Some(1), 1), "a pane moved, nobody came");
+        assert!(!client_arrived(Some(2), 1), "a client left");
+    }
 }

@@ -94,10 +94,21 @@ a visible tiled pane, which is how zellij launches a keybind pipe's missing targ
 be done live: `load_plugins` is only read at session start, and reconfigure() merging it is a
 no-op.)
 
+**A client that enters the session gets the keybinds back.** zellij keeps the runtime config per
+client id and replaces an attaching client's with the one it carries from disk — which has none of
+this. The manager watches the session's client count and re-applies the last run's blocks the
+moment it rises, so jumping in from another session, switching with a session manager or a plain
+`zellij attach` all keep the managed keys.
+
 ## Notes
 
-- One manager instance runs per session (a `load_plugins` background plugin). Operations are
-  serialized; a verb piped during a run is queued.
+- One manager instance runs **per client**, not per session: zellij loads a plugin again for every
+  client id that enters. Each instance applies for its own client, and its reports say which
+  (`lvim-zpm install (client 2):`).
+- `start-or-reload-plugin` reaches only the instances of clients that are attached right now; the
+  rest keep the old wasm until the session is restarted.
+- Operations are serialized; a verb piped during a run is queued.
 - `status` only looks; it never clones, pulls or applies.
-- The permission cache (`~/.cache/zellij/permissions.kdl`) is appended idempotently; zellij may
-  rewrite that file, and the manager re-adds grants on the next run.
+- The permission cache (`~/.cache/zellij/permissions.kdl`) is rewritten per plugin — the manager's
+  own block too, by `install.sh` — because zellij may rewrite that file from a live server's memory
+  and resurrect a stale block.

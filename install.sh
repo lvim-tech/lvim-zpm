@@ -81,18 +81,26 @@ else
 fi
 
 # ── 3. permissions ───────────────────────────────────────────────────────────
+# REWRITTEN, not appended once: an install from before a permission was added keeps its old block,
+# and a background plugin asking for more than it was granted puts a prompt on the screen. The awk
+# drops this wasm's block, the printf appends the current one — the same move zpm makes for the
+# plugins it manages.
 perms="$cache_dir/permissions.kdl"
-if [ -d "$cache_dir" ] && { [ ! -f "$perms" ] || ! grep -q "lvim-zpm\.wasm" "$perms"; }; then
+if [ -d "$cache_dir" ]; then
+    t="$perms.zpm.$$"
+    awk -v k="\"$wasm\" {" 'BEGIN{s=0} index($0,k)==1{s=1;next} s{if($0~/^}/)s=0;next} {print}' "$perms" 2>/dev/null > "$t" || true
     {
         printf '"%s" {\n' "$wasm"
         printf '    RunCommands\n'
         printf '    Reconfigure\n'
         printf '    ReadCliPipes\n'
+        printf '    ReadApplicationState\n'
         printf '}\n'
-    } >> "$perms"
-    say "permissions pre-granted: $perms"
+    } >> "$t"
+    mv "$t" "$perms"
+    say "permissions granted: $perms"
 else
-    say "permissions already granted (or no cache dir yet — Zellij will ask once)"
+    say "no cache dir yet — Zellij will ask for the permissions once"
 fi
 
 # ── 4. the manifest ──────────────────────────────────────────────────────────
